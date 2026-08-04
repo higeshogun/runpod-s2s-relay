@@ -8,6 +8,7 @@ import traceback
 import wave
 
 import aiohttp
+import numpy as np
 import webrtcvad
 import websockets
 
@@ -44,6 +45,36 @@ def pcm_to_wav_bytes(pcm_bytes):
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
 
+def _resample_int16(samples, orig_sr, target_sr):
+    if orig_sr == target_sr or len(samples) == 0:
+        return samples
+    duration = len(samples) / orig_sr
+    target_len = max(1, int(round(duration * target_sr)))
+    orig_idx = np.arange(len(samples), dtype=np.float64)
+    target_idx = np.linspace(0, len(samples) - 1, target_len)
+    resampled = np.interp(target_idx, orig_idx, samples.astype(np.float64))
+    return resampled.astype(np.int16)
+
+def synthesized_wav_to_pcm16(wav_bytes, target_sr=SAMPLE_RATE):
+    # The GPU worker returns a WAV container (Kokoro synthesizes at 24kHz).
+    # The client protocol expects raw base64 PCM16 mono at SAMPLE_RATE with no
+    # container/header - forwarding the WAV bytes as-is corrupts playback
+    # (header bytes decode as noise, and a 24kHz->16kHz sample-rate mismatch
+    # makes audio play back slow and pitched down). Always unwrap the WAV and
+    # resample to the exact rate the client expects before sending it on.
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        n_channels = wf.getnchannels()
+        sr = wf.getframerate()
+        sampwidth = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
+    if sampwidth != 2:
+        raise ValueError(f"unsupported sample width {sampwidth} in synthesized audio")
+    samples = np.frombuffer(raw, dtype=np.int16)
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels).mean(axis=1).astype(np.int16)
+    samples = _resample_int16(samples, sr, target_sr)
+    return samples.astype(np.int16).tobytes()
+
 async def call_gpu_endpoint(session, wav_bytes, history, instructions=None):
     payload = {"input": {"audio_base64": base64.b64encode(wav_bytes).decode(), "history": history}}
     if instructions:
@@ -68,16 +99,16 @@ async def call_gpu_endpoint(session, wav_bytes, history, instructions=None):
             raise TimeoutError(f"GPU job {job_id} did not complete within {GPU_CALL_TIMEOUT_S}s")
         await asyncio.sleep(POLL_INTERVAL_S)
         async with session.get(poll_url, headers=headers,
-                                 timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                timeout=aiohttp.ClientTimeout(total=30)) as resp:
             text = await resp.text()
             data = json.loads(text)
-        status = data.get("status")
-        print(f"[relay] job {job_id} status={status}", flush=True)
-        if status == "COMPLETED":
-            return data.get("output", {})
-        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
-            raise RuntimeError(f"GPU job {job_id} ended with status={status}: {text[:300]}")
-        # else IN_QUEUE / IN_PROGRESS -> keep polling
+            status = data.get("status")
+            print(f"[relay] job {job_id} status={status}", flush=True)
+            if status == "COMPLETED":
+                return data.get("output", {})
+            if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                raise RuntimeError(f"GPU job {job_id} ended with status={status}: {text[:300]}")
+            # else IN_QUEUE / IN_PROGRESS -> keep polling
 
 class TurnBuffer:
     def __init__(self):
@@ -174,8 +205,16 @@ async def process_turn(websocket, session, turn, history, instructions=None):
 
     audio_b64 = output.get("response_audio_base64", "")
     if audio_b64:
-        await send_event(websocket, {"type": "response.output_audio.delta", "delta": audio_b64})
-        await send_event(websocket, {"type": "response.audio.delta", "delta": audio_b64})
+        try:
+            wav_bytes_out = base64.b64decode(audio_b64)
+            pcm16 = synthesized_wav_to_pcm16(wav_bytes_out)
+            out_b64 = base64.b64encode(pcm16).decode()
+        except Exception as e:
+            print(f"[relay] failed to convert synthesized audio to raw PCM16/{SAMPLE_RATE}Hz: {e}", flush=True)
+            out_b64 = None
+        if out_b64:
+            await send_event(websocket, {"type": "response.output_audio.delta", "delta": out_b64})
+            await send_event(websocket, {"type": "response.audio.delta", "delta": out_b64})
 
     await send_event(websocket, {"type": "response.done"})
 
