@@ -213,8 +213,13 @@ async def process_turn(websocket, session, turn, history, instructions=None):
             print(f"[relay] failed to convert synthesized audio to raw PCM16/{SAMPLE_RATE}Hz: {e}", flush=True)
             out_b64 = None
         if out_b64:
+            # Send exactly one audio event. Previously this also sent a
+            # "response.audio.delta" alias of the *same* clip as a
+            # compatibility fallback, but if the client listens for both
+            # event names it plays the identical audio twice back-to-back,
+            # sounding like the response is repeating itself. Only the
+            # primary spec event name is sent now.
             await send_event(websocket, {"type": "response.output_audio.delta", "delta": out_b64})
-            await send_event(websocket, {"type": "response.audio.delta", "delta": out_b64})
 
     await send_event(websocket, {"type": "response.done"})
 
