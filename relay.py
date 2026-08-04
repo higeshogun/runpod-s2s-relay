@@ -73,6 +73,57 @@ class TurnBuffer:
         return b"".join(self.frames)
 
 
+async def send_event(websocket, event):
+    await websocket.send(json.dumps(event))
+
+
+async def process_turn(websocket, session, turn, history):
+    wav_bytes = pcm_to_wav_bytes(turn.audio_bytes())
+    turn.reset()
+
+    try:
+        output = await call_gpu_endpoint(session, wav_bytes, history)
+    except Exception as e:
+        print(f"[relay] GPU endpoint call failed: {e}", flush=True)
+        await send_event(websocket, {"type": "error", "error": {"message": str(e)}})
+        return
+
+    transcript = output.get("transcript", "")
+    print(f"[relay] transcript={transcript!r}", flush=True)
+    if not transcript:
+        return
+
+    response_text = output.get("response_text", "")
+    history.extend([{"role": "user", "content": transcript},
+                     {"role": "assistant", "content": response_text}])
+    history[:] = history[-MAX_HISTORY_TURNS * 2:]
+
+    # Input transcription (final only; the GPU worker's STT call is not incremental)
+    await send_event(websocket, {
+        "type": "conversation.item.input_audio_transcription.completed",
+        "transcript": transcript,
+    })
+
+    # Output transcript (text response)
+    if response_text:
+        await send_event(websocket, {
+            "type": "response.output_audio_transcript.delta",
+            "delta": response_text,
+        })
+        await send_event(websocket, {
+            "type": "response.output_audio_transcript.done",
+            "transcript": response_text,
+        })
+
+    # Output audio (single chunk; the GPU worker returns the full synthesized clip, not a stream)
+    audio_b64 = output.get("response_audio_base64", "")
+    if audio_b64:
+        await send_event(websocket, {"type": "response.output_audio.delta", "delta": audio_b64})
+        await send_event(websocket, {"type": "response.audio.delta", "delta": audio_b64})
+
+    await send_event(websocket, {"type": "response.done"})
+
+
 async def handle_client(websocket):
     peer = websocket.remote_address
     print(f"[relay] client connected: {peer}", flush=True)
@@ -84,11 +135,28 @@ async def handle_client(websocket):
     try:
         async with aiohttp.ClientSession() as session:
             async for message in websocket:
-                if not isinstance(message, bytes):
-                    print(f"[relay] ignoring non-bytes message: {str(message)[:200]!r}", flush=True)
-                    continue  # ignore text control frames for now
+                if isinstance(message, bytes):
+                    chunk = message
+                else:
+                    try:
+                        event = json.loads(message)
+                    except json.JSONDecodeError:
+                        print(f"[relay] non-JSON text message ignored: {str(message)[:200]!r}", flush=True)
+                        continue
 
-                leftover += message
+                    ev_type = event.get("type")
+                    if ev_type == "input_audio_buffer.append":
+                        audio_b64 = event.get("audio", "")
+                        try:
+                            chunk = base64.b64decode(audio_b64)
+                        except Exception as e:
+                            print(f"[relay] failed to decode input audio: {e}", flush=True)
+                            continue
+                    else:
+                        print(f"[relay] ignoring unsupported event type: {ev_type!r}", flush=True)
+                        continue
+
+                leftover += chunk
                 while len(leftover) >= FRAME_BYTES:
                     frame, leftover = leftover[:FRAME_BYTES], leftover[FRAME_BYTES:]
                     try:
@@ -103,26 +171,7 @@ async def handle_client(websocket):
 
                     if turn.finished():
                         print(f"[relay] turn finished, speech_ms={turn.speech_ms}, audio_bytes={len(turn.audio_bytes())}", flush=True)
-                        wav_bytes = pcm_to_wav_bytes(turn.audio_bytes())
-                        turn.reset()
-
-                        output = await call_gpu_endpoint(session, wav_bytes, history)
-                        transcript = output.get("transcript", "")
-                        print(f"[relay] transcript={transcript!r}", flush=True)
-                        if not transcript:
-                            continue
-
-                        response_text = output.get("response_text", "")
-                        history.extend([{"role": "user", "content": transcript},
-                                         {"role": "assistant", "content": response_text}])
-                        history[:] = history[-MAX_HISTORY_TURNS * 2:]
-
-                        await websocket.send(json.dumps({"type": "transcript", "text": transcript}))
-                        await websocket.send(json.dumps({"type": "response_text", "text": response_text}))
-
-                        audio_b64 = output.get("response_audio_base64", "")
-                        if audio_b64:
-                            await websocket.send(base64.b64decode(audio_b64))
+                        await process_turn(websocket, session, turn, history)
     except Exception:
         print("[relay] handler crashed:", flush=True)
         traceback.print_exc()
