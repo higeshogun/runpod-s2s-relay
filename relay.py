@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import time
 import traceback
 import wave
 
@@ -12,7 +13,8 @@ import websockets
 
 RUNPOD_ENDPOINT_ID = os.environ["RUNPOD_ENDPOINT_ID"]
 RUNPOD_API_KEY = os.environ["RUNPOD_API_KEY"]
-RUNSYNC_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync"
+RUN_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/run"
+STATUS_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status"
 
 SAMPLE_RATE = 16000
 FRAME_MS = 30
@@ -21,6 +23,7 @@ SILENCE_MS_TO_END_TURN = 700
 MIN_SPEECH_MS = 250
 MAX_HISTORY_TURNS = 6
 GPU_CALL_TIMEOUT_S = 300  # cold starts (CUDA image + Whisper + Gemma 4 + Kokoro) can take minutes
+POLL_INTERVAL_S = 2  # /runsync has a hidden ~90s hold; poll /run + /status instead so long cold starts don't get cut off
 HEARTBEAT_INTERVAL_S = 8  # keep the connection/proxy alive during long GPU cold starts
 
 DEFAULT_INSTRUCTIONS = (
@@ -46,13 +49,35 @@ async def call_gpu_endpoint(session, wav_bytes, history, instructions=None):
     if instructions:
         payload["input"]["instructions"] = instructions
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
-    print(f"[relay] calling GPU endpoint, wav_bytes={len(wav_bytes)}", flush=True)
-    async with session.post(RUNSYNC_URL, json=payload, headers=headers,
-                             timeout=aiohttp.ClientTimeout(total=GPU_CALL_TIMEOUT_S)) as resp:
+
+    print(f"[relay] submitting GPU job, wav_bytes={len(wav_bytes)}", flush=True)
+    async with session.post(RUN_URL, json=payload, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=30)) as resp:
         text = await resp.text()
-        print(f"[relay] GPU endpoint responded status={resp.status} body={text[:500]}", flush=True)
+        print(f"[relay] /run responded status={resp.status} body={text[:300]}", flush=True)
         data = json.loads(text)
-        return data.get("output", {})
+
+    job_id = data.get("id")
+    if not job_id:
+        raise RuntimeError(f"no job id returned from /run: {text[:300]}")
+
+    poll_url = f"{STATUS_URL}/{job_id}"
+    deadline = time.monotonic() + GPU_CALL_TIMEOUT_S
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"GPU job {job_id} did not complete within {GPU_CALL_TIMEOUT_S}s")
+        await asyncio.sleep(POLL_INTERVAL_S)
+        async with session.get(poll_url, headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            text = await resp.text()
+            data = json.loads(text)
+        status = data.get("status")
+        print(f"[relay] job {job_id} status={status}", flush=True)
+        if status == "COMPLETED":
+            return data.get("output", {})
+        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+            raise RuntimeError(f"GPU job {job_id} ended with status={status}: {text[:300]}")
+        # else IN_QUEUE / IN_PROGRESS -> keep polling
 
 class TurnBuffer:
     def __init__(self):
