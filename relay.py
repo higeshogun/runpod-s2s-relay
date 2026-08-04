@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import traceback
 import wave
 
 import aiohttp
@@ -36,9 +37,12 @@ def pcm_to_wav_bytes(pcm_bytes):
 async def call_gpu_endpoint(session, wav_bytes, history):
     payload = {"input": {"audio_base64": base64.b64encode(wav_bytes).decode(), "history": history}}
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
+    print(f"[relay] calling GPU endpoint, wav_bytes={len(wav_bytes)}", flush=True)
     async with session.post(RUNSYNC_URL, json=payload, headers=headers,
                              timeout=aiohttp.ClientTimeout(total=60)) as resp:
-        data = await resp.json()
+        text = await resp.text()
+        print(f"[relay] GPU endpoint responded status={resp.status} body={text[:500]}", flush=True)
+        data = json.loads(text)
         return data.get("output", {})
 
 
@@ -70,48 +74,67 @@ class TurnBuffer:
 
 
 async def handle_client(websocket):
+    peer = websocket.remote_address
+    print(f"[relay] client connected: {peer}", flush=True)
     history = []
     turn = TurnBuffer()
     leftover = b""
+    frame_count = 0
 
-    async with aiohttp.ClientSession() as session:
-        async for message in websocket:
-            if not isinstance(message, bytes):
-                continue  # ignore text control frames for now
+    try:
+        async with aiohttp.ClientSession() as session:
+            async for message in websocket:
+                if not isinstance(message, bytes):
+                    print(f"[relay] ignoring non-bytes message: {str(message)[:200]!r}", flush=True)
+                    continue  # ignore text control frames for now
 
-            leftover += message
-            while len(leftover) >= FRAME_BYTES:
-                frame, leftover = leftover[:FRAME_BYTES], leftover[FRAME_BYTES:]
-                is_speech = vad.is_speech(frame, SAMPLE_RATE)
-                turn.add_frame(frame, is_speech)
-
-                if turn.finished():
-                    wav_bytes = pcm_to_wav_bytes(turn.audio_bytes())
-                    turn.reset()
-
-                    output = await call_gpu_endpoint(session, wav_bytes, history)
-                    transcript = output.get("transcript", "")
-                    if not transcript:
+                leftover += message
+                while len(leftover) >= FRAME_BYTES:
+                    frame, leftover = leftover[:FRAME_BYTES], leftover[FRAME_BYTES:]
+                    try:
+                        is_speech = vad.is_speech(frame, SAMPLE_RATE)
+                    except Exception as e:
+                        print(f"[relay] VAD error: {e}", flush=True)
                         continue
+                    frame_count += 1
+                    if frame_count % 50 == 0:
+                        print(f"[relay] frames processed={frame_count} is_speech={is_speech} triggered={turn.triggered}", flush=True)
+                    turn.add_frame(frame, is_speech)
 
-                    response_text = output.get("response_text", "")
-                    history.extend([{"role": "user", "content": transcript},
-                                     {"role": "assistant", "content": response_text}])
-                    history[:] = history[-MAX_HISTORY_TURNS * 2:]
+                    if turn.finished():
+                        print(f"[relay] turn finished, speech_ms={turn.speech_ms}, audio_bytes={len(turn.audio_bytes())}", flush=True)
+                        wav_bytes = pcm_to_wav_bytes(turn.audio_bytes())
+                        turn.reset()
 
-                    await websocket.send(json.dumps({"type": "transcript", "text": transcript}))
-                    await websocket.send(json.dumps({"type": "response_text", "text": response_text}))
+                        output = await call_gpu_endpoint(session, wav_bytes, history)
+                        transcript = output.get("transcript", "")
+                        print(f"[relay] transcript={transcript!r}", flush=True)
+                        if not transcript:
+                            continue
 
-                    audio_b64 = output.get("response_audio_base64", "")
-                    if audio_b64:
-                        await websocket.send(base64.b64decode(audio_b64))
+                        response_text = output.get("response_text", "")
+                        history.extend([{"role": "user", "content": transcript},
+                                         {"role": "assistant", "content": response_text}])
+                        history[:] = history[-MAX_HISTORY_TURNS * 2:]
+
+                        await websocket.send(json.dumps({"type": "transcript", "text": transcript}))
+                        await websocket.send(json.dumps({"type": "response_text", "text": response_text}))
+
+                        audio_b64 = output.get("response_audio_base64", "")
+                        if audio_b64:
+                            await websocket.send(base64.b64decode(audio_b64))
+    except Exception:
+        print("[relay] handler crashed:", flush=True)
+        traceback.print_exc()
+    finally:
+        print(f"[relay] client disconnected: {peer}", flush=True)
 
 
 async def main():
     host = os.environ.get("RELAY_HOST", "0.0.0.0")
     port = int(os.environ.get("RELAY_PORT", "8765"))
     async with websockets.serve(handle_client, host, port, max_size=None):
-        print(f"Relay listening on ws://{host}:{port}")
+        print(f"Relay listening on ws://{host}:{port}", flush=True)
         await asyncio.Future()
 
 
