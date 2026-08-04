@@ -20,6 +20,7 @@ FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # 16-bit mono PCM
 SILENCE_MS_TO_END_TURN = 700
 MIN_SPEECH_MS = 250
 MAX_HISTORY_TURNS = 6
+GPU_CALL_TIMEOUT_S = 300  # cold starts (CUDA image + Whisper + Gemma 4 + Kokoro) can take minutes
 
 vad = webrtcvad.Vad(2)  # 0-3, higher = stricter about what counts as speech
 
@@ -39,7 +40,7 @@ async def call_gpu_endpoint(session, wav_bytes, history):
     headers = {"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"}
     print(f"[relay] calling GPU endpoint, wav_bytes={len(wav_bytes)}", flush=True)
     async with session.post(RUNSYNC_URL, json=payload, headers=headers,
-                             timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                             timeout=aiohttp.ClientTimeout(total=GPU_CALL_TIMEOUT_S)) as resp:
         text = await resp.text()
         print(f"[relay] GPU endpoint responded status={resp.status} body={text[:500]}", flush=True)
         data = json.loads(text)
@@ -182,7 +183,8 @@ async def handle_client(websocket):
 async def main():
     host = os.environ.get("RELAY_HOST", "0.0.0.0")
     port = int(os.environ.get("RELAY_PORT", "8765"))
-    async with websockets.serve(handle_client, host, port, max_size=None):
+    async with websockets.serve(handle_client, host, port, max_size=None,
+                                 ping_interval=20, ping_timeout=GPU_CALL_TIMEOUT_S):
         print(f"Relay listening on ws://{host}:{port}", flush=True)
         await asyncio.Future()
 
