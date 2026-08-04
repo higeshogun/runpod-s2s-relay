@@ -21,6 +21,7 @@ SILENCE_MS_TO_END_TURN = 700
 MIN_SPEECH_MS = 250
 MAX_HISTORY_TURNS = 6
 GPU_CALL_TIMEOUT_S = 300  # cold starts (CUDA image + Whisper + Gemma 4 + Kokoro) can take minutes
+HEARTBEAT_INTERVAL_S = 8  # keep the connection/proxy alive during long GPU cold starts
 
 DEFAULT_INSTRUCTIONS = (
     "You are a strict two-way interpreter. Translate only the preceding utterance "
@@ -82,16 +83,44 @@ class TurnBuffer:
 async def send_event(websocket, event):
     await websocket.send(json.dumps(event))
 
+async def _heartbeat(websocket):
+    # Sends harmless, spec-valid empty audio deltas periodically so that neither the
+    # client nor any intermediary proxy treats a long GPU cold start as a dead connection.
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+            await send_event(websocket, {"type": "response.output_audio.delta", "delta": ""})
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[relay] heartbeat send failed: {e}", flush=True)
+
 async def process_turn(websocket, session, turn, history, instructions=None):
     wav_bytes = pcm_to_wav_bytes(turn.audio_bytes())
     turn.reset()
 
     try:
+        await send_event(websocket, {"type": "response.created"})
+    except Exception as e:
+        print(f"[relay] failed to send response.created, aborting turn: {e}", flush=True)
+        return
+
+    heartbeat_task = asyncio.create_task(_heartbeat(websocket))
+    try:
         output = await call_gpu_endpoint(session, wav_bytes, history, instructions=instructions)
     except Exception as e:
         print(f"[relay] GPU endpoint call failed: {e}", flush=True)
-        await send_event(websocket, {"type": "error", "error": {"message": str(e)}})
+        try:
+            await send_event(websocket, {"type": "error", "error": {"message": str(e)}})
+        except Exception:
+            pass
         return
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
     transcript = output.get("transcript", "")
     print(f"[relay] transcript={transcript!r}", flush=True)
